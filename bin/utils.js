@@ -33,18 +33,19 @@ exports.setPersistence = () => {
   if (typeof persistenceDir === 'string') {
     console.info('Persisting documents to "' + persistenceDir + '"')
     // @ts-ignore
-    const LeveldbPersistence = require('./y-leveldb').LeveldbPersistence
+    const LeveldbPersistence = require('y-leveldb').LeveldbPersistence
     const ldb = new LeveldbPersistence(persistenceDir)
     persistence = {
       provider: ldb,
       bindState: async (docName, ydoc) => {
-        console.log("bindState", docName);
         const persistedYdoc = await ldb.getYDoc(docName);
         persistedYdoc.gc = false;
         const newUpdates = Y.encodeStateAsUpdate(ydoc);
+        
         const clients = {
           clientsSize: new Y.PermanentUserData(persistedYdoc).clients.size
         }
+
         const collaborators =  new Set();
         const debouncedFunc = debounceF((init) => {
           addVersion(ydoc, collaborators, init, clients);
@@ -52,13 +53,15 @@ exports.setPersistence = () => {
         
         ldb.storeUpdate(docName, newUpdates)
         Y.applyUpdate(ydoc, Y.encodeStateAsUpdate(persistedYdoc));
+
         ydoc.on('update', update => {
+
           const data = Y.decodeStateVector(update);
           if(data.size > 0) {
             const [[_, clientID]] = Array.from(data);
             collaborators.add(clientID);
           }
-          console.log("Updateeee", count++);
+
           debouncedFunc();
           ldb.storeUpdate(docName, update)
         })
