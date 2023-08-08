@@ -9,8 +9,8 @@ const map = require('lib0/dist/map.cjs')
 
 const debounce = require('lodash.debounce')
 
-const callbackHandler = require('./callback.js').callbackHandler
-const isCallbackSet = require('./callback.js').isCallbackSet
+const callbackHandler = require('y-websocket/bin/callback.js').callbackHandler
+const isCallbackSet = require('y-websocket/bin/callback.js').isCallbackSet
 
 const CALLBACK_DEBOUNCE_WAIT = parseInt(process.env.CALLBACK_DEBOUNCE_WAIT) || 2000
 const CALLBACK_DEBOUNCE_MAXWAIT = parseInt(process.env.CALLBACK_DEBOUNCE_MAXWAIT) || 10000
@@ -27,47 +27,45 @@ console.log('DIR', persistenceDir);
 /**
  * @type {{bindState: function(string,WSSharedDoc):void, writeState:function(string,WSSharedDoc):Promise<any>, provider: any}|null}
  */
-let count = 0
+
 let persistence = null
-exports.setPersistence = () => {
-  if (typeof persistenceDir === 'string') {
-    console.info('Persisting documents to "' + persistenceDir + '"')
-    // @ts-ignore
-    const LeveldbPersistence = require('y-leveldb').LeveldbPersistence
-    const ldb = new LeveldbPersistence(persistenceDir)
-    persistence = {
-      provider: ldb,
-      bindState: async (docName, ydoc) => {
-        const persistedYdoc = await ldb.getYDoc(docName);
-        persistedYdoc.gc = false;
-        const newUpdates = Y.encodeStateAsUpdate(ydoc);
-        
-        const clients = {
-          clientsSize: new Y.PermanentUserData(persistedYdoc).clients.size
+if (typeof persistenceDir === 'string') {
+  console.info('Persisting documents to "' + persistenceDir + '"')
+  // @ts-ignore
+  const LeveldbPersistence = require('y-leveldb').LeveldbPersistence
+  const ldb = new LeveldbPersistence(persistenceDir)
+  persistence = {
+    provider: ldb,
+    bindState: async (docName, ydoc) => {
+      const persistedYdoc = await ldb.getYDoc(docName);
+      persistedYdoc.gc = false;
+      const newUpdates = Y.encodeStateAsUpdate(ydoc);
+      
+      const clients = {
+        clientsSize: new Y.PermanentUserData(persistedYdoc).clients.size
+      }
+
+      const collaborators =  new Set();
+      const debouncedFunc = debounceF((init) => {
+        addVersion(ydoc, collaborators, init, clients);
+      });
+      
+      ldb.storeUpdate(docName, newUpdates)
+      Y.applyUpdate(ydoc, Y.encodeStateAsUpdate(persistedYdoc));
+
+      ydoc.on('update', update => {
+
+        const data = Y.decodeStateVector(update);
+        if(data.size > 0) {
+          const [[_, clientID]] = Array.from(data);
+          collaborators.add(clientID);
         }
 
-        const collaborators =  new Set();
-        const debouncedFunc = debounceF((init) => {
-          addVersion(ydoc, collaborators, init, clients);
-        });
-        
-        ldb.storeUpdate(docName, newUpdates)
-        Y.applyUpdate(ydoc, Y.encodeStateAsUpdate(persistedYdoc));
-
-        ydoc.on('update', update => {
-
-          const data = Y.decodeStateVector(update);
-          if(data.size > 0) {
-            const [[_, clientID]] = Array.from(data);
-            collaborators.add(clientID);
-          }
-
-          debouncedFunc();
-          ldb.storeUpdate(docName, update)
-        })
-      },
-      writeState: async (docName, ydoc) => {}
-    }
+        debouncedFunc();
+        ldb.storeUpdate(docName, update)
+      })
+    },
+    writeState: async (docName, ydoc) => {}
   }
 }
 
@@ -220,7 +218,6 @@ class WSSharedDoc extends Y.Doc {
  * @return {WSSharedDoc}
  */
 const getYDoc = (docname, gc = false, isFromExport) => map.setIfUndefined(docs, docname, () => {
-  debugger
   const doc = new WSSharedDoc(docname)
   doc.gc = gc
   if (persistence !== null && !isFromExport) {
@@ -267,7 +264,6 @@ const messageListener = (conn, doc, message) => {
  * @param {any} conn
  */
 const closeConn = (doc, conn) => {
-  debugger
   if (doc.conns.has(conn)) {
     /**
      * @type {Set<number>}
@@ -314,7 +310,6 @@ exports.setupWSConnection = (conn, req, { docName = req.url.slice(1).split('?')[
   conn.binaryType = 'arraybuffer'
   // get doc, initialize if it does not exist yet
   const doc = getYDoc(docName, false);
-  debugger
   doc.conns.set(conn, new Set())
   // listen and reply to events
   conn.on('message', /** @param {ArrayBuffer} message */ message => messageListener(conn, doc, new Uint8Array(message)))
