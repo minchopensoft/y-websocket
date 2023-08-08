@@ -4,6 +4,7 @@ const awarenessProtocol = require('y-protocols/dist/awareness.cjs')
 
 const encoding = require('lib0/dist/encoding.cjs')
 const decoding = require('lib0/dist/decoding.cjs')
+const mutex = require('lib0/dist/mutex.cjs')
 const map = require('lib0/dist/map.cjs')
 
 const debounce = require('lodash.debounce')
@@ -21,28 +22,103 @@ const wsReadyStateClosed = 3 // eslint-disable-line
 
 // disable gc when using snapshots!
 const gcEnabled = process.env.GC !== 'false' && process.env.GC !== '0'
-const persistenceDir = process.env.YPERSISTENCE
+const persistenceDir = process.env.YPERSISTENCE;
+console.log('DIR', persistenceDir);
 /**
  * @type {{bindState: function(string,WSSharedDoc):void, writeState:function(string,WSSharedDoc):Promise<any>, provider: any}|null}
  */
+let count = 0
 let persistence = null
-if (typeof persistenceDir === 'string') {
-  console.info('Persisting documents to "' + persistenceDir + '"')
-  // @ts-ignore
-  const LeveldbPersistence = require('y-leveldb').LeveldbPersistence
-  const ldb = new LeveldbPersistence(persistenceDir)
-  persistence = {
-    provider: ldb,
-    bindState: async (docName, ydoc) => {
-      const persistedYdoc = await ldb.getYDoc(docName)
-      const newUpdates = Y.encodeStateAsUpdate(ydoc)
-      ldb.storeUpdate(docName, newUpdates)
-      Y.applyUpdate(ydoc, Y.encodeStateAsUpdate(persistedYdoc))
-      ydoc.on('update', update => {
-        ldb.storeUpdate(docName, update)
-      })
-    },
-    writeState: async (docName, ydoc) => {}
+exports.setPersistence = () => {
+  if (typeof persistenceDir === 'string') {
+    console.info('Persisting documents to "' + persistenceDir + '"')
+    // @ts-ignore
+    const LeveldbPersistence = require('./y-leveldb').LeveldbPersistence
+    const ldb = new LeveldbPersistence(persistenceDir)
+    persistence = {
+      provider: ldb,
+      bindState: async (docName, ydoc) => {
+        console.log("bindState", docName);
+        const persistedYdoc = await ldb.getYDoc(docName);
+        persistedYdoc.gc = false;
+        const newUpdates = Y.encodeStateAsUpdate(ydoc);
+        const clients = {
+          clientsSize: new Y.PermanentUserData(persistedYdoc).clients.size
+        }
+        const collaborators =  new Set();
+        const debouncedFunc = debounceF((init) => {
+          addVersion(ydoc, collaborators, init, clients);
+        });
+        
+        ldb.storeUpdate(docName, newUpdates)
+        Y.applyUpdate(ydoc, Y.encodeStateAsUpdate(persistedYdoc));
+        ydoc.on('update', update => {
+          const data = Y.decodeStateVector(update);
+          if(data.size > 0) {
+            const [[_, clientID]] = Array.from(data);
+            collaborators.add(clientID);
+          }
+          console.log("Updateeee", count++);
+          debouncedFunc();
+          ldb.storeUpdate(docName, update)
+        })
+      },
+      writeState: async (docName, ydoc) => {}
+    }
+  }
+}
+
+function debounceF(func) {
+  let timeout;
+  const init = {
+    initial: true,
+    timer: 600
+  }
+  return (...args) => {
+      const later = () => {
+          clearTimeout(timeout);
+          func(...args, init);
+      };
+      clearTimeout(timeout);
+      timeout = setTimeout(later, init.timer);
+  };
+};
+
+function addVersion (doc, collaborators, init, clients) {
+  const permanentUserData = new Y.PermanentUserData(doc);
+  if(init.initial || clients.clientsSize != permanentUserData.clients.size) {
+    init.initial = false;
+    init.timer = 15000;
+    clients.clientsSize = permanentUserData.clients.size;
+    return;
+  }
+
+  const users = new Set();
+  collaborators.forEach(clientID => {
+    const user = permanentUserData.getUserByClientId(clientID);
+    if(user) {
+      users.add(user)
+    }
+  })  
+
+  const versions = doc.getArray('versions');
+  const prevVersion = versions.length === 0 ? null : versions.get(versions.length - 1);
+  const prevSnapshot = prevVersion === null ? Y.emptySnapshot : Y.decodeSnapshot(prevVersion.snapshot);
+  const snapshot = Y.snapshot(doc);
+
+  if (prevVersion != null) {
+    prevSnapshot.sv.set(prevVersion.clientID, prevSnapshot.sv.get(prevVersion.clientID) + 1);
+  }
+
+  if (!Y.equalSnapshots(prevSnapshot, snapshot) && users.size > 0) {
+    const usersInArticle = Array.from(users).join('|');
+    versions.push([{
+      date: new Date().getTime(),
+      snapshot: Y.encodeSnapshot(snapshot),
+      clientID: doc.clientID,
+      users: usersInArticle
+    }])
+    collaborators.clear();
   }
 }
 
@@ -50,9 +126,6 @@ if (typeof persistenceDir === 'string') {
  * @param {{bindState: function(string,WSSharedDoc):void,
  * writeState:function(string,WSSharedDoc):Promise<any>,provider:any}|null} persistence_
  */
-exports.setPersistence = persistence_ => {
-  persistence = persistence_
-}
 
 /**
  * @return {null|{bindState: function(string,WSSharedDoc):void,
@@ -89,8 +162,9 @@ class WSSharedDoc extends Y.Doc {
    * @param {string} name
    */
   constructor (name) {
-    super({ gc: gcEnabled })
+    super({ gc: false })
     this.name = name
+    this.mux = mutex.createMutex()
     /**
      * Maps from conn to set of controlled user ids. Delete all user ids from awareness when this conn is closed
      * @type {Map<Object, Set<number>>}
@@ -142,10 +216,11 @@ class WSSharedDoc extends Y.Doc {
  * @param {boolean} gc - whether to allow gc on the doc (applies only when created)
  * @return {WSSharedDoc}
  */
-const getYDoc = (docname, gc = true) => map.setIfUndefined(docs, docname, () => {
+const getYDoc = (docname, gc = false, isFromExport) => map.setIfUndefined(docs, docname, () => {
+  debugger
   const doc = new WSSharedDoc(docname)
   doc.gc = gc
-  if (persistence !== null) {
+  if (persistence !== null && !isFromExport) {
     persistence.bindState(docname, doc)
   }
   docs.set(docname, doc)
@@ -165,17 +240,14 @@ const messageListener = (conn, doc, message) => {
     const decoder = decoding.createDecoder(message)
     const messageType = decoding.readVarUint(decoder)
     switch (messageType) {
-      case messageSync:
+      case messageSync: {
         encoding.writeVarUint(encoder, messageSync)
-        syncProtocol.readSyncMessage(decoder, encoder, doc, conn)
-
-        // If the `encoder` only contains the type of reply message and no
-        // message, there is no need to send the message. When `encoder` only
-        // contains the type of reply, its length is 1.
+        syncProtocol.readSyncMessage(decoder, encoder, doc, null)
         if (encoding.length(encoder) > 1) {
           send(doc, conn, encoding.toUint8Array(encoder))
         }
         break
+      }
       case messageAwareness: {
         awarenessProtocol.applyAwarenessUpdate(doc.awareness, decoding.readVarUint8Array(decoder), conn)
         break
@@ -192,6 +264,7 @@ const messageListener = (conn, doc, message) => {
  * @param {any} conn
  */
 const closeConn = (doc, conn) => {
+  debugger
   if (doc.conns.has(conn)) {
     /**
      * @type {Set<number>}
@@ -234,10 +307,11 @@ const pingTimeout = 30000
  * @param {any} req
  * @param {any} opts
  */
-exports.setupWSConnection = (conn, req, { docName = req.url.slice(1).split('?')[0], gc = true } = {}) => {
+exports.setupWSConnection = (conn, req, { docName = req.url.slice(1).split('?')[0], gc = false } = {}) => {
   conn.binaryType = 'arraybuffer'
   // get doc, initialize if it does not exist yet
-  const doc = getYDoc(docName, gc)
+  const doc = getYDoc(docName, false);
+  debugger
   doc.conns.set(conn, new Set())
   // listen and reply to events
   conn.on('message', /** @param {ArrayBuffer} message */ message => messageListener(conn, doc, new Uint8Array(message)))
